@@ -42,6 +42,9 @@ use std::ops::IndexMut;
 use bitvec::vec::BitVec;
 use controlled_option::Niche;
 
+#[cfg(feature = "json")]
+use serde::{Deserialize, Serialize};
+
 use crate::utils::cmp_option;
 use crate::utils::equals_option;
 
@@ -57,6 +60,7 @@ use crate::utils::equals_option;
 /// _same type_, we do not do anything to ensure that you only use a handle with the corresponding
 /// arena.
 #[repr(transparent)]
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 pub struct Handle<T> {
     index: NonZeroU32,
     _phantom: PhantomData<T>,
@@ -222,6 +226,23 @@ impl<T> Arena<T> {
     }
 }
 
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
+pub struct ArenaData<T> {
+    items: Vec<T>,
+}
+
+impl<T> From<Arena<T>> for ArenaData<T> {
+    fn from(value: Arena<T>) -> Self {
+        Self {
+            items: value
+                .items
+                .iter()
+                .map(|t| unsafe { t.assume_init_read() }) // `assume_init_read` creates a copy for us
+                .collect(),
+        }
+    }
+}
+
 //-------------------------------------------------------------------------------------------------
 // Supplemental arenas
 
@@ -352,6 +373,23 @@ where
 {
     fn index_mut(&mut self, handle: Handle<H>) -> &mut T {
         self.get_mut_or_default(handle)
+    }
+}
+
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
+pub struct SupplementalArenaData<T> {
+    items: Vec<T>,
+}
+
+impl<H, T> From<SupplementalArena<H, T>> for SupplementalArenaData<T> {
+    fn from(value: SupplementalArena<H, T>) -> Self {
+        Self {
+            items: value
+                .items
+                .iter()
+                .map(|t| unsafe { t.assume_init_read() }) // `assume_init_read` creates a copy for us
+                .collect(),
+        }
     }
 }
 

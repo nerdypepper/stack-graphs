@@ -9,6 +9,7 @@ use itertools::Itertools;
 use lsp_positions::Offset;
 use lsp_positions::Position;
 use lsp_positions::Span;
+use serde::de::Deserialize;
 use serde::ser::Serialize;
 use serde::ser::SerializeSeq;
 use serde::ser::SerializeStruct;
@@ -428,7 +429,7 @@ impl Serialize for InStackGraph<'_, &Edge> {
         let graph = self.1;
         let edge = self.0;
 
-        let mut ser = serializer.serialize_struct("edge", 3)?;
+        let mut ser = serializer.serialize_struct("Edge", 3)?;
         ser.serialize_field("source", &self.with(&graph[edge.source].id()))?;
         ser.serialize_field("sink", &self.with(&graph[edge.sink].id()))?;
         ser.serialize_field("precedence", &edge.precedence)?;
@@ -444,7 +445,7 @@ impl Serialize for InStackGraph<'_, &Span> {
     where
         S: Serializer,
     {
-        let mut ser = serializer.serialize_struct("span", 2)?;
+        let mut ser = serializer.serialize_struct("Span", 2)?;
         ser.serialize_field("start", &self.with(&self.0.start))?;
         ser.serialize_field("end", &self.with(&self.0.end))?;
         ser.end()
@@ -458,9 +459,11 @@ impl Serialize for InStackGraph<'_, &Position> {
     {
         let position = self.0;
 
-        let mut ser = serializer.serialize_struct("position", 2)?;
+        let mut ser = serializer.serialize_struct("Position", 2)?;
         ser.serialize_field("line", &position.line)?;
         ser.serialize_field("column", &self.with(&position.column))?;
+        ser.serialize_field("containing_line", &position.containing_line)?;
+        ser.serialize_field("trimmed_line", &position.trimmed_line)?;
         ser.end()
     }
 }
@@ -472,7 +475,7 @@ impl Serialize for InStackGraph<'_, &Offset> {
     {
         let offset = self.0;
 
-        let mut ser = serializer.serialize_struct("offset", 3)?;
+        let mut ser = serializer.serialize_struct("Offset", 3)?;
         ser.serialize_field("utf8_offset", &offset.utf8_offset)?;
         ser.serialize_field("utf16_offset", &offset.utf16_offset)?;
         ser.serialize_field("grapheme_offset", &offset.grapheme_offset)?;

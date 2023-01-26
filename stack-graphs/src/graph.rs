@@ -49,6 +49,7 @@
 //! [`Edge`]: struct.Edge.html
 //! [`File`]: struct.File.html
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::num::NonZeroU32;
@@ -61,8 +62,13 @@ use fxhash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::arena::Arena;
+use crate::arena::ArenaData;
 use crate::arena::Handle;
 use crate::arena::SupplementalArena;
+use crate::arena::SupplementalArenaData;
+
+#[cfg(feature = "json")]
+use serde::{ser::SerializeStruct, Deserialize, Deserializer, Serialize};
 
 //-------------------------------------------------------------------------------------------------
 // String content
@@ -85,6 +91,7 @@ const INITIAL_STRING_CAPACITY: usize = 512;
 /// we hand out don't outlive the buffers.)
 ///
 /// [interner]: https://matklad.github.io/2020/03/22/fast-simple-rust-interner.html
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 struct InternedStringArena {
     current_buffer: Vec<u8>,
     full_buffers: Vec<Vec<u8>>,
@@ -424,9 +431,41 @@ impl Handle<File> {
 /// _local ID_ that must be unique within its file.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "json", derive(Deserialize))]
 pub struct NodeID {
+    #[serde(default)]
+    #[serde(deserialize_with = "deser_controlled_option")]
     file: ControlledOption<Handle<File>>,
     local_id: u32,
+}
+
+#[cfg(feature = "json")]
+impl Serialize for NodeID {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if self.file.is_some() {
+            let mut node_id = serializer.serialize_struct("NodeID", 2)?;
+            node_id.serialize_field("file", &self.file.into_option().unwrap())?;
+            node_id.serialize_field("local_id", &self.local_id)?;
+            node_id.end()
+        } else {
+            let mut node_id = serializer.serialize_struct("NodeID", 1)?;
+            node_id.serialize_field("local_id", &self.local_id)?;
+            node_id.end()
+        }
+    }
+}
+
+#[cfg(feature = "json")]
+fn deser_controlled_option<'de, D, T>(deserializer: D) -> Result<ControlledOption<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: controlled_option::Niche,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.into())
 }
 
 const ROOT_NODE_ID: u32 = 1;
@@ -531,14 +570,31 @@ impl NodeID {
 
 /// A node in a stack graph.
 #[repr(C)]
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "json", serde(tag = "type"))]
 pub enum Node {
+    #[serde(rename = "drop_scopes")]
     DropScopes(DropScopesNode),
+
+    #[serde(rename = "jump_to")]
     JumpTo(JumpToNode),
+
+    #[serde(rename = "pop_scoped_symbol")]
     PopScopedSymbol(PopScopedSymbolNode),
+
+    #[serde(rename = "pop_symbol")]
     PopSymbol(PopSymbolNode),
+
+    #[serde(rename = "push_scoped_symbol")]
     PushScopedSymbol(PushScopedSymbolNode),
+
+    #[serde(rename = "push_symbol")]
     PushSymbol(PushSymbolNode),
+
+    #[serde(rename = "root")]
     Root(RootNode),
+
+    #[serde(rename = "scope")]
     Scope(ScopeNode),
 }
 
@@ -741,11 +797,18 @@ impl IndexMut<Handle<Node>> for StackGraph {
 
 /// Removes everything from the current scope stack.
 #[repr(C)]
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 pub struct DropScopesNode {
     /// The unique identifier for this node.
     pub id: NodeID,
+
+    #[serde(skip, default)]
     _symbol: ControlledOption<Handle<Symbol>>,
+
+    #[serde(skip, default)]
     _scope: NodeID,
+
+    #[serde(skip, default)]
     _is_endpoint: bool,
 }
 
@@ -796,10 +859,17 @@ impl<'a> Display for DisplayDropScopesNode<'a> {
 /// The singleton "jump to" node, which allows a name binding path to jump back to another part of
 /// the graph.
 #[repr(C)]
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 pub struct JumpToNode {
     id: NodeID,
+
+    #[serde(skip, default)]
     _symbol: ControlledOption<Handle<Symbol>>,
+
+    #[serde(skip, default)]
     _scope: NodeID,
+
+    #[serde(skip, default)]
     _is_endpoint: bool,
 }
 
@@ -830,12 +900,16 @@ impl Display for JumpToNode {
 /// requested symbol, or if the top of the symbol stack doesn't have an attached scope list, then
 /// the path is not allowed to enter this node.
 #[repr(C)]
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 pub struct PopScopedSymbolNode {
     /// The unique identifier for this node.
     pub id: NodeID,
     /// The symbol to pop off the symbol stack.
     pub symbol: Handle<Symbol>,
+
+    #[serde(skip, default)]
     _scope: NodeID,
+
     /// Whether this node represents a reference in the source language.
     pub is_definition: bool,
 }
@@ -902,11 +976,14 @@ impl<'a> Display for DisplayPopScopedSymbolNode<'a> {
 /// Pops a symbol from the symbol stack.  If the top of the symbol stack doesn't match the
 /// requested symbol, then the path is not allowed to enter this node.
 #[repr(C)]
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 pub struct PopSymbolNode {
     /// The unique identifier for this node.
     pub id: NodeID,
     /// The symbol to pop off the symbol stack.
     pub symbol: Handle<Symbol>,
+
+    #[serde(skip, default)]
     _scope: NodeID,
     /// Whether this node represents a reference in the source language.
     pub is_definition: bool,
@@ -973,6 +1050,7 @@ impl<'a> Display for DisplayPopSymbolNode<'a> {
 
 /// Pushes a scoped symbol onto the symbol stack.
 #[repr(C)]
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 pub struct PushScopedSymbolNode {
     /// The unique identifier for this node.
     pub id: NodeID,
@@ -1050,6 +1128,7 @@ impl<'a> Display for DisplayPushScopedSymbolNode<'a> {
 
 /// Pushes a symbol onto the symbol stack.
 #[repr(C)]
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 pub struct PushSymbolNode {
     /// The unique identifier for this node.
     pub id: NodeID,
@@ -1121,10 +1200,14 @@ impl<'a> Display for DisplayPushSymbolNode<'a> {
 
 /// The singleton root node, which allows a name binding path to cross between files.
 #[repr(C)]
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 pub struct RootNode {
     id: NodeID,
+    #[serde(skip, default)]
     _symbol: ControlledOption<Handle<Symbol>>,
+    #[serde(skip, default)]
     _scope: NodeID,
+    #[serde(skip, default)]
     _is_endpoint: bool,
 }
 
@@ -1208,10 +1291,13 @@ impl NodeIDHandles {
 /// referred to on the scope stack, which allows "jump to" nodes in any other
 /// part of the graph can jump back here.
 #[repr(C)]
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 pub struct ScopeNode {
     /// The unique identifier for this node.
     pub id: NodeID,
+    #[serde(skip, default)]
     _symbol: ControlledOption<Handle<Symbol>>,
+    #[serde(skip, default)]
     _scope: NodeID,
     pub is_exported: bool,
 }
@@ -1285,6 +1371,7 @@ pub struct Edge {
     pub precedence: i32,
 }
 
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 struct OutgoingEdge {
     sink: Handle<Node>,
     precedence: i32,
@@ -1407,6 +1494,46 @@ pub struct StackGraph {
     node_id_handles: NodeIDHandles,
     outgoing_edges: SupplementalArena<Node, SmallVec<[OutgoingEdge; 8]>>,
     pub(crate) debug_info: SupplementalArena<Node, DebugInfo>,
+}
+
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
+pub struct StackGraphData<'a> {
+    interned_strings: InternedStringArena,
+    //pub(crate) symbols: ArenaData<Symbol>,
+    symbol_handles: FxHashMap<Cow<'a, str>, Handle<Symbol>>,
+    //pub(crate) strings: ArenaData<InternedString>,
+    string_handles: FxHashMap<Cow<'a, str>, Handle<InternedString>>,
+    //pub(crate) files: ArenaData<File>,
+    file_handles: FxHashMap<Cow<'a, str>, Handle<File>>,
+    //pub(crate) nodes: ArenaData<Node>,
+    // pub(crate) source_info: SupplementalArena<Node, SourceInfo>,
+    // node_id_handles: NodeIDHandles,
+    outgoing_edges: SupplementalArenaData<SmallVec<[OutgoingEdge; 8]>>,
+    // pub(crate) debug_info: SupplementalArena<Node, DebugInfo>,
+}
+
+impl<'a> From<StackGraph> for StackGraphData<'a> {
+    fn from(value: StackGraph) -> Self {
+        Self {
+            interned_strings: value.interned_strings,
+            symbol_handles: value
+                .symbol_handles
+                .into_iter()
+                .map(|(k, v)| (k.into(), v))
+                .collect(),
+            string_handles: value
+                .string_handles
+                .into_iter()
+                .map(|(k, v)| (k.into(), v))
+                .collect(),
+            file_handles: value
+                .file_handles
+                .into_iter()
+                .map(|(k, v)| (k.into(), v))
+                .collect(),
+            outgoing_edges: value.outgoing_edges.into(),
+        }
+    }
 }
 
 impl StackGraph {
