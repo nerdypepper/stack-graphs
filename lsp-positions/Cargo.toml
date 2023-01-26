@@ -18,8 +18,10 @@ test = false
 
 [features]
 default = ["tree-sitter"]
+serde = [ "dep:serde" ]
 
 [dependencies]
 memchr = "2.4"
 tree-sitter = { version=">= 0.19", optional=true }
+serde = { version = "1", optional = true, features = [ "derive" ] }
 unicode-segmentation = { version="1.8" }
