@@ -27,6 +27,8 @@
 //! [lsp]: https://microsoft.github.io/language-server-protocol/
 //! [lsp-utf16]: https://microsoft.github.io/language-server-protocol/specifications/specification-current/#textDocuments
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
 use memchr::memchr;
@@ -43,6 +45,7 @@ fn utf16_len(string: &str) -> usize {
 
 /// All of the position information that we have about a character in a source file
 #[repr(C)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct Position {
     /// The 0-indexed line number containing the character
@@ -105,6 +108,7 @@ impl PartialOrd<tree_sitter::Point> for Position {
 
 /// All of the position information that we have about a range of content in a source file
 #[repr(C)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct Span {
     pub start: Position,
@@ -140,6 +144,7 @@ impl PartialOrd for Span {
 /// different units
 ///
 /// All offsets are 0-indexed.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Offset {
     /// The number of UTF-8-encoded bytes appearing before this character in the string

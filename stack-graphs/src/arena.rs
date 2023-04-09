@@ -42,6 +42,9 @@ use std::ops::IndexMut;
 use bitvec::vec::BitVec;
 use controlled_option::Niche;
 
+#[cfg(feature = "json")]
+use serde::{Deserialize, Serialize};
+
 use crate::utils::cmp_option;
 use crate::utils::equals_option;
 
@@ -57,6 +60,7 @@ use crate::utils::equals_option;
 /// _same type_, we do not do anything to ensure that you only use a handle with the corresponding
 /// arena.
 #[repr(transparent)]
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 pub struct Handle<T> {
     index: NonZeroU32,
     _phantom: PhantomData<T>,
@@ -222,6 +226,23 @@ impl<T> Arena<T> {
     }
 }
 
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
+pub struct ArenaData<T> {
+    items: Vec<T>,
+}
+
+impl<T> From<Arena<T>> for ArenaData<T> {
+    fn from(value: Arena<T>) -> Self {
+        Self {
+            items: value
+                .items
+                .iter()
+                .map(|t| unsafe { t.assume_init_read() }) // `assume_init_read` creates a copy for us
+                .collect(),
+        }
+    }
+}
+
 //-------------------------------------------------------------------------------------------------
 // Supplemental arenas
 
@@ -354,6 +375,35 @@ where
         self.get_mut_or_default(handle)
     }
 }
+
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
+pub struct SupplementalArenaData<T> {
+    items: Vec<T>,
+}
+
+impl<H, T> From<&SupplementalArena<H, T>> for SupplementalArenaData<T> {
+    fn from(value: &SupplementalArena<H, T>) -> Self {
+        Self {
+            items: value
+                .items
+                .iter()
+                .map(|t| unsafe { t.assume_init_read() }) // `assume_init_read` creates a copy for us
+                .collect(),
+        }
+    }
+}
+
+// impl<H, T> From<SupplementalArena<H, T>> for SupplementalArenaData<T> {
+//     fn from(value: SupplementalArena<H, T>) -> Self {
+//         Self {
+//             items: value
+//                 .items
+//                 .iter()
+//                 .map(|t| unsafe { t.assume_init_read() }) // `assume_init_read` creates a copy for us
+//                 .collect(),
+//         }
+//     }
+// }
 
 //-------------------------------------------------------------------------------------------------
 // Handle sets
@@ -1114,3 +1164,52 @@ impl<T> Clone for Deque<T> {
 }
 
 impl<T> Copy for Deque<T> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // test serde for InternedStringArena and InternedStringContent
+    #[cfg(feature = "json")]
+    #[test]
+    fn serde_arenas_and_handles() {
+        let mut arena = Arena::new();
+        let data = 3;
+        let data_handle = arena.add(data);
+        assert_eq!(
+            serde_json::to_value(&data_handle).unwrap(),
+            serde_json::json!({
+                "index": 1,
+                "_phantom": null,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value::<&ArenaData<u32>>(&arena.into()).unwrap(),
+            serde_json::json!({
+                "items": [0, 3]
+            })
+        );
+    }
+
+    // test serde for SupplementalArena
+    // TODO: segfaults
+    #[cfg(feature = "json")]
+    #[test]
+    fn serde_supplemental_arena() {
+        let mut arena = Arena::<u32>::new();
+        let h1 = arena.add(1);
+        let mut supplemental = SupplementalArena::<u32, String>::new();
+        assert_eq!(supplemental.get(h1), None);
+        supplemental[h1].push_str("hiya");
+        // assert_eq!(supplemental.get(h1).map(String::as_str), Some("hiya"));
+        drop(supplemental);
+
+        // assert_eq!(
+        //     serde_json::to_value::<&SupplementalArenaData<String>>(&(&supplemental).into())
+        //         .unwrap(),
+        //     serde_json::json!({
+        //         "items": ["", "hiya"]
+        //     })
+        // );
+    }
+}

@@ -49,6 +49,7 @@
 //! [`Edge`]: struct.Edge.html
 //! [`File`]: struct.File.html
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::num::NonZeroU32;
@@ -59,20 +60,56 @@ use controlled_option::ControlledOption;
 use either::Either;
 use fxhash::FxHashMap;
 use smallvec::SmallVec;
+use string_interner::StringInterner;
 
 use crate::arena::Arena;
+use crate::arena::ArenaData;
 use crate::arena::Handle;
 use crate::arena::SupplementalArena;
+use crate::arena::SupplementalArenaData;
+
+#[cfg(feature = "json")]
+use serde::{ser::SerializeStruct, Deserialize, Deserializer, Serialize};
 
 //-------------------------------------------------------------------------------------------------
 // String content
 
 #[repr(C)]
-struct InternedStringContent {
-    // See InternedStringArena below for how we fill in these fields safely.
-    start: *const u8,
-    len: usize,
-}
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
+struct InternedStringContent(string_interner::symbol::SymbolU32);
+
+//
+// // this is obviously lossy, an ideal implementation of string interning
+// // would store the arena and maintain safe handles to strings instead of
+// // raw pointers. this fundamentally changes the way stack-graphs would
+// // work. we need to find a conversion between arenas + raw-pointers to
+// // a more manageable/serde friendly datastructure.
+// #[cfg(feature = "json")]
+// impl Serialize for InternedStringContent {
+//     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+//     where
+//         S: serde::Serializer,
+//     {
+//         let mut interned_string_content =
+//             serializer.serialize_struct("InternedStringContent", 1)?;
+//         interned_string_content.serialize_field("content", self.as_str())?;
+//         interned_string_content.end()
+//     }
+// }
+//
+// // placeholder implementation
+// #[cfg(feature = "json")]
+// impl<'de> Deserialize<'de> for InternedStringContent {
+//     fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+//     where
+//         D: Deserializer<'de>,
+//     {
+//         Ok(Self {
+//             start: std::ptr::null(),
+//             len: 0,
+//         })
+//     }
+// }
 
 const INITIAL_STRING_CAPACITY: usize = 512;
 
@@ -85,68 +122,23 @@ const INITIAL_STRING_CAPACITY: usize = 512;
 /// we hand out don't outlive the buffers.)
 ///
 /// [interner]: https://matklad.github.io/2020/03/22/fast-simple-rust-interner.html
-struct InternedStringArena {
-    current_buffer: Vec<u8>,
-    full_buffers: Vec<Vec<u8>>,
-}
+// #[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
+// struct InternedStringArena {
+//     current_buffer: Vec<u8>,
+//     full_buffers: Vec<Vec<u8>>,
+// }
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
+struct InternedStringArena(StringInterner);
 
 impl InternedStringArena {
     fn new() -> InternedStringArena {
-        InternedStringArena {
-            current_buffer: Vec::with_capacity(INITIAL_STRING_CAPACITY),
-            full_buffers: Vec::new(),
-        }
+        InternedStringArena(StringInterner::default())
     }
 
     // Adds a new string.  This does not check whether we've already stored a string with the same
     // content; that is handled down below in `StackGraph::add_symbol` and `add_file`.
     fn add(&mut self, value: &str) -> InternedStringContent {
-        // Is there enough room in current_buffer to hold this string?
-        let value = value.as_bytes();
-        let len = value.len();
-        let capacity = self.current_buffer.capacity();
-        let remaining_capacity = capacity - self.current_buffer.len();
-        if len > remaining_capacity {
-            // If not, move current_buffer over into full_buffers (so that we hang onto it until
-            // we're dropped) and allocate a new current_buffer that's at least big enough to hold
-            // this string.
-            let new_capacity = (capacity.max(len) + 1).next_power_of_two();
-            let new_buffer = Vec::with_capacity(new_capacity);
-            let old_buffer = std::mem::replace(&mut self.current_buffer, new_buffer);
-            self.full_buffers.push(old_buffer);
-        }
-
-        // Copy the string's content into current_buffer and return a pointer to it.  That pointer
-        // is stable since we never allow the current_buffer to be resized — once we run out of
-        // room, we allocate a _completely new buffer_ to replace it.
-        let start_index = self.current_buffer.len();
-        self.current_buffer.extend_from_slice(value);
-        let start = unsafe { self.current_buffer.as_ptr().add(start_index) };
-        InternedStringContent { start, len }
-    }
-}
-
-impl InternedStringContent {
-    /// Returns the content of this string as a `str`.  This is safe as long as the lifetime of the
-    /// InternedStringContent is outlived by the lifetime of the InternedStringArena that holds its
-    /// data.  That is guaranteed because we store the InternedStrings in an Arena alongside the
-    /// InternedStringArena, and only hand out references to them.
-    fn as_str(&self) -> &str {
-        unsafe {
-            let bytes = std::slice::from_raw_parts(self.start, self.len);
-            std::str::from_utf8_unchecked(bytes)
-        }
-    }
-
-    // Returns a supposedly 'static reference to the string's data.  The string data isn't really
-    // static, but we are careful only to use this as a key in the HashMap that StackGraph uses to
-    // track whether we've stored a particular symbol already.  That HashMap lives alongside the
-    // InternedStringArena that holds the data, so we can get away with a technically incorrect
-    // 'static lifetime here.  As an extra precaution, this method is is marked as unsafe so that
-    // we don't inadvertently call it from anywhere else in the crate.
-    unsafe fn as_hash_key(&self) -> &'static str {
-        let bytes = std::slice::from_raw_parts(self.start, self.len);
-        std::str::from_utf8_unchecked(bytes)
+        InternedStringContent(self.0.get_or_intern(value))
     }
 }
 
@@ -164,20 +156,9 @@ impl InternedStringContent {
 /// multiple `Symbol` instances with the same content.  That means that you can compare _handles_
 /// to symbols using simple equality, without having to dereference into the `StackGraph` arena.
 #[repr(C)]
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 pub struct Symbol {
     content: InternedStringContent,
-}
-
-impl Symbol {
-    pub fn as_str(&self) -> &str {
-        self.content.as_str()
-    }
-}
-
-impl PartialEq<&str> for Symbol {
-    fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
-    }
 }
 
 impl StackGraph {
@@ -237,6 +218,7 @@ impl Handle<Symbol> {
 // Interned strings
 
 /// Arbitrary string content associated with some part of a stack graph.
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 #[repr(C)]
 pub struct InternedString {
     content: InternedStringContent,
@@ -317,6 +299,7 @@ impl Handle<InternedString> {
 /// choice.  If your files belong to packages or repositories, they should include the package or
 /// repository IDs to make sure that files in different packages or repositories don't clash with
 /// each other.
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 pub struct File {
     /// The name of this source file.
     name: InternedStringContent,
@@ -424,9 +407,41 @@ impl Handle<File> {
 /// _local ID_ that must be unique within its file.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[cfg_attr(feature = "json", derive(Deserialize))]
 pub struct NodeID {
+    #[cfg_attr(feature = "json", serde(default))]
+    #[cfg_attr(feature = "json", serde(deserialize_with = "deser_controlled_option"))]
     file: ControlledOption<Handle<File>>,
     local_id: u32,
+}
+
+#[cfg(feature = "json")]
+impl Serialize for NodeID {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if self.file.is_some() {
+            let mut node_id = serializer.serialize_struct("NodeID", 2)?;
+            node_id.serialize_field("file", &self.file.into_option().unwrap())?;
+            node_id.serialize_field("local_id", &self.local_id)?;
+            node_id.end()
+        } else {
+            let mut node_id = serializer.serialize_struct("NodeID", 1)?;
+            node_id.serialize_field("local_id", &self.local_id)?;
+            node_id.end()
+        }
+    }
+}
+
+#[cfg(feature = "json")]
+fn deser_controlled_option<'de, D, T>(deserializer: D) -> Result<ControlledOption<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: controlled_option::Niche,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.into())
 }
 
 const ROOT_NODE_ID: u32 = 1;
@@ -531,14 +546,31 @@ impl NodeID {
 
 /// A node in a stack graph.
 #[repr(C)]
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "json", serde(tag = "type"))]
 pub enum Node {
+    #[cfg_attr(feature = "json", serde(rename = "drop_scopes"))]
     DropScopes(DropScopesNode),
+
+    #[cfg_attr(feature = "json", serde(rename = "jump_to"))]
     JumpTo(JumpToNode),
+
+    #[cfg_attr(feature = "json", serde(rename = "pop_scoped_symbol"))]
     PopScopedSymbol(PopScopedSymbolNode),
+
+    #[cfg_attr(feature = "json", serde(rename = "pop_symbol"))]
     PopSymbol(PopSymbolNode),
+
+    #[cfg_attr(feature = "json", serde(rename = "push_scoped_symbol"))]
     PushScopedSymbol(PushScopedSymbolNode),
+
+    #[cfg_attr(feature = "json", serde(rename = "push_symbol"))]
     PushSymbol(PushSymbolNode),
+
+    #[cfg_attr(feature = "json", serde(rename = "root"))]
     Root(RootNode),
+
+    #[cfg_attr(feature = "json", serde(rename = "scope"))]
     Scope(ScopeNode),
 }
 
@@ -741,11 +773,18 @@ impl IndexMut<Handle<Node>> for StackGraph {
 
 /// Removes everything from the current scope stack.
 #[repr(C)]
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 pub struct DropScopesNode {
     /// The unique identifier for this node.
     pub id: NodeID,
+
+    #[cfg_attr(feature = "json", serde(skip, default))]
     _symbol: ControlledOption<Handle<Symbol>>,
+
+    #[cfg_attr(feature = "json", serde(skip, default))]
     _scope: NodeID,
+
+    #[cfg_attr(feature = "json", serde(skip, default))]
     _is_endpoint: bool,
 }
 
@@ -796,10 +835,17 @@ impl<'a> Display for DisplayDropScopesNode<'a> {
 /// The singleton "jump to" node, which allows a name binding path to jump back to another part of
 /// the graph.
 #[repr(C)]
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 pub struct JumpToNode {
     id: NodeID,
+
+    #[cfg_attr(feature = "json", serde(skip, default))]
     _symbol: ControlledOption<Handle<Symbol>>,
+
+    #[cfg_attr(feature = "json", serde(skip, default))]
     _scope: NodeID,
+
+    #[cfg_attr(feature = "json", serde(skip, default))]
     _is_endpoint: bool,
 }
 
@@ -830,12 +876,16 @@ impl Display for JumpToNode {
 /// requested symbol, or if the top of the symbol stack doesn't have an attached scope list, then
 /// the path is not allowed to enter this node.
 #[repr(C)]
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 pub struct PopScopedSymbolNode {
     /// The unique identifier for this node.
     pub id: NodeID,
     /// The symbol to pop off the symbol stack.
     pub symbol: Handle<Symbol>,
+
+    #[cfg_attr(feature = "json", serde(skip, default))]
     _scope: NodeID,
+
     /// Whether this node represents a reference in the source language.
     pub is_definition: bool,
 }
@@ -902,11 +952,14 @@ impl<'a> Display for DisplayPopScopedSymbolNode<'a> {
 /// Pops a symbol from the symbol stack.  If the top of the symbol stack doesn't match the
 /// requested symbol, then the path is not allowed to enter this node.
 #[repr(C)]
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 pub struct PopSymbolNode {
     /// The unique identifier for this node.
     pub id: NodeID,
     /// The symbol to pop off the symbol stack.
     pub symbol: Handle<Symbol>,
+
+    #[cfg_attr(feature = "json", serde(skip, default))]
     _scope: NodeID,
     /// Whether this node represents a reference in the source language.
     pub is_definition: bool,
@@ -973,6 +1026,7 @@ impl<'a> Display for DisplayPopSymbolNode<'a> {
 
 /// Pushes a scoped symbol onto the symbol stack.
 #[repr(C)]
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 pub struct PushScopedSymbolNode {
     /// The unique identifier for this node.
     pub id: NodeID,
@@ -1050,6 +1104,7 @@ impl<'a> Display for DisplayPushScopedSymbolNode<'a> {
 
 /// Pushes a symbol onto the symbol stack.
 #[repr(C)]
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 pub struct PushSymbolNode {
     /// The unique identifier for this node.
     pub id: NodeID,
@@ -1121,10 +1176,14 @@ impl<'a> Display for DisplayPushSymbolNode<'a> {
 
 /// The singleton root node, which allows a name binding path to cross between files.
 #[repr(C)]
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 pub struct RootNode {
     id: NodeID,
+    #[cfg_attr(feature = "json", serde(skip, default))]
     _symbol: ControlledOption<Handle<Symbol>>,
+    #[cfg_attr(feature = "json", serde(skip, default))]
     _scope: NodeID,
+    #[cfg_attr(feature = "json", serde(skip, default))]
     _is_endpoint: bool,
 }
 
@@ -1151,6 +1210,7 @@ impl Display for RootNode {
     }
 }
 
+// #[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 struct NodeIDHandles {
     files: SupplementalArena<File, Vec<Option<Handle<Node>>>>,
 }
@@ -1208,10 +1268,13 @@ impl NodeIDHandles {
 /// referred to on the scope stack, which allows "jump to" nodes in any other
 /// part of the graph can jump back here.
 #[repr(C)]
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 pub struct ScopeNode {
     /// The unique identifier for this node.
     pub id: NodeID,
+    #[cfg_attr(feature = "json", serde(skip, default))]
     _symbol: ControlledOption<Handle<Symbol>>,
+    #[cfg_attr(feature = "json", serde(skip, default))]
     _scope: NodeID,
     pub is_exported: bool,
 }
@@ -1285,6 +1348,7 @@ pub struct Edge {
     pub precedence: i32,
 }
 
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
 struct OutgoingEdge {
     sink: Handle<Node>,
     precedence: i32,
@@ -1397,7 +1461,7 @@ impl StackGraph {
 pub struct StackGraph {
     interned_strings: InternedStringArena,
     pub(crate) symbols: Arena<Symbol>,
-    symbol_handles: FxHashMap<&'static str, Handle<Symbol>>,
+    symbol_handles: Vec<Handle<Symbol>>,
     pub(crate) strings: Arena<InternedString>,
     string_handles: FxHashMap<&'static str, Handle<InternedString>>,
     pub(crate) files: Arena<File>,
@@ -1407,6 +1471,57 @@ pub struct StackGraph {
     node_id_handles: NodeIDHandles,
     outgoing_edges: SupplementalArena<Node, SmallVec<[OutgoingEdge; 8]>>,
     pub(crate) debug_info: SupplementalArena<Node, DebugInfo>,
+}
+
+#[cfg_attr(feature = "json", derive(Serialize, Deserialize))]
+pub struct StackGraphData<'a> {
+    interned_strings: InternedStringArena,
+    pub(crate) symbols: ArenaData<Symbol>,
+    symbol_handles: FxHashMap<Cow<'a, str>, Handle<Symbol>>,
+    pub(crate) strings: ArenaData<InternedString>,
+    string_handles: FxHashMap<Cow<'a, str>, Handle<InternedString>>,
+    pub(crate) files: ArenaData<File>,
+    file_handles: FxHashMap<Cow<'a, str>, Handle<File>>,
+    pub(crate) nodes: ArenaData<Node>,
+    // pub(crate) source_info: SupplementalArena<Node, SourceInfo>,
+    // node_id_handles: NodeIDHandles,
+    // outgoing_edges: SupplementalArenaData<SmallVec<[OutgoingEdge; 8]>>,
+    // pub(crate) debug_info: SupplementalArena<Node, DebugInfo>,
+}
+
+impl<'a> From<StackGraph> for StackGraphData<'a> {
+    fn from(value: StackGraph) -> Self {
+        let symbol_handles = value
+            .symbol_handles
+            .into_iter()
+            .map(|(k, v)| (k.into(), v))
+            .collect();
+        let string_handles = value
+            .string_handles
+            .into_iter()
+            .map(|(k, v)| (k.into(), v))
+            .collect();
+        let file_handles = value
+            .file_handles
+            .into_iter()
+            .map(|(k, v)| (k.into(), v))
+            .collect();
+
+        // TODO: the Into implementation results in a segfault
+        // let outgoing_edges = value.outgoing_edges.into();
+
+        Self {
+            interned_strings: value.interned_strings,
+            symbols: value.symbols.into(),
+            symbol_handles,
+            strings: value.strings.into(),
+            string_handles,
+            files: value.files.into(),
+            file_handles,
+            nodes: value.nodes.into(),
+            // outgoing_edges,
+        }
+    }
 }
 
 impl StackGraph {
@@ -1586,5 +1701,26 @@ impl Default for StackGraph {
             outgoing_edges: SupplementalArena::new(),
             debug_info: SupplementalArena::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // test serde for InternedStringArena and InternedStringContent
+    #[cfg(feature = "json")]
+    #[test]
+    fn serde_interned_string_content() {
+        let mut arena = InternedStringArena::new();
+        let src = "foo";
+        let foo = arena.add(&src[..3]);
+        assert_eq!(
+            serde_json::to_value(&foo).unwrap(),
+            serde_json::json!({
+                "content": "foo",
+            })
+        );
+        assert!(true);
     }
 }
